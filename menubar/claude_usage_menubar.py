@@ -134,6 +134,9 @@ class ClaudeUsageApp(rumps.App):
         self._notif_sent: dict = {}
         self._notifications_enabled: bool = True
 
+        # Previous values for recovery detection
+        self._prev_pct: dict = {}  # {metric_key: last_pct}
+
         # ── Menu items ──
         # Header
         self.header_item = make_item("╭─ Claude Code Usage ──────────────────╮")
@@ -285,7 +288,7 @@ class ClaudeUsageApp(rumps.App):
         self.updated_item.title = f"│  Updated: {now_str}"
 
         # Notifications
-        self._check_notifications(s_pct, w_pct, sn_pct)
+        self._check_notifications(s_pct, w_pct, sn_pct, five.get("resets_at", ""))
 
     @staticmethod
     def _to_pct(value) -> float | None:
@@ -312,7 +315,7 @@ class ClaudeUsageApp(rumps.App):
 
     # ── Notifications ──────────────────────────────────────────────────────────
 
-    def _check_notifications(self, s_pct, w_pct, sn_pct):
+    def _check_notifications(self, s_pct, w_pct, sn_pct, session_resets_at: str):
         if not self._notifications_enabled:
             return
 
@@ -322,17 +325,55 @@ class ClaudeUsageApp(rumps.App):
             "sonnet": ("🎯 Sonnet", sn_pct),
         }
         now = time.time()
+
         for key, (label, pct) in metrics.items():
-            if pct is None or pct < NOTIF_THRESHOLD:
+            if pct is None:
                 continue
-            last = self._notif_sent.get(key, 0)
-            if now - last < NOTIF_COOLDOWN:
-                continue
-            self._notif_sent[key] = now
-            self._send_notification(
-                title="⚠️ Claude Usage High",
-                message=f"{label} usage is at {int(pct)}%",
-            )
+            prev = self._prev_pct.get(key)
+
+            # High usage alert (>= 80%)
+            if pct >= NOTIF_THRESHOLD:
+                last = self._notif_sent.get(f"{key}_high", 0)
+                if now - last >= NOTIF_COOLDOWN:
+                    self._notif_sent[f"{key}_high"] = now
+                    self._send_notification(
+                        title="⚠️ Claude Usage High",
+                        message=f"{label} usage is at {int(pct)}%",
+                    )
+
+            # Recovery alert: was high (>= 60%), now low (< 30%)
+            if prev is not None and prev >= 60 and pct < 30:
+                last = self._notif_sent.get(f"{key}_recovered", 0)
+                if now - last >= NOTIF_COOLDOWN:
+                    self._notif_sent[f"{key}_recovered"] = now
+                    self._send_notification(
+                        title="✅ Claude Usage Available",
+                        message=f"{label} dropped to {int(pct)}% — good to go",
+                    )
+
+            self._prev_pct[key] = pct
+
+        # Reset soon alert: session was high and resets within 20 minutes
+        if session_resets_at and s_pct is not None:
+            try:
+                target = datetime.fromisoformat(session_resets_at)
+                remaining = (target - datetime.now(timezone.utc)).total_seconds()
+                prev_s = self._prev_pct.get("session_was_high", False)
+                if s_pct >= 60:
+                    self._prev_pct["session_was_high"] = True
+                if prev_s and 0 < remaining <= 1200:  # within 20 min
+                    last = self._notif_sent.get("session_reset_soon", 0)
+                    if now - last >= NOTIF_COOLDOWN:
+                        self._notif_sent["session_reset_soon"] = now
+                        mins = int(remaining / 60)
+                        self._send_notification(
+                            title="🔄 Session Resetting Soon",
+                            message=f"Session resets in {mins}m — usage will drop",
+                        )
+                if remaining <= 0:
+                    self._prev_pct["session_was_high"] = False
+            except Exception:
+                pass
 
     @staticmethod
     def _send_notification(title: str, message: str):
