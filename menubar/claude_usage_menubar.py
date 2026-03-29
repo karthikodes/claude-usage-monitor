@@ -12,7 +12,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import rumps
 
@@ -24,6 +25,14 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 BAR_WIDTH = 18
 NOTIF_THRESHOLD = 80.0
 NOTIF_COOLDOWN = 3600  # 1 hour between repeated notifications per metric
+
+# ── Boost promotion config ────────────────────────────────────────────────────
+# Update these for future promotions. Set BOOST_END to None to disable.
+BOOST_START = datetime(2026, 3, 13, tzinfo=ZoneInfo("America/New_York"))
+BOOST_END = datetime(2026, 3, 28, tzinfo=ZoneInfo("America/New_York"))
+BOOST_PEAK_START = 8   # 8 AM ET — boost OFF (normal usage)
+BOOST_PEAK_END = 14    # 2 PM ET — boost ON again after this
+BOOST_TZ = ZoneInfo("America/New_York")
 
 
 # ── Token helpers ──────────────────────────────────────────────────────────────
@@ -105,10 +114,91 @@ def time_until(iso_str: str) -> str:
         return ""
 
 
-def menu_bar_title(s_pct, w_pct) -> str:
-    """Compact title: CC 5%·18%"""
+def boost_status() -> dict | None:
+    """Check if the 2x boost promotion is currently active.
+
+    Returns None if promotion is expired/not started, or a dict with:
+        active: bool — is boost on right now?
+        next_change_sec: int — seconds until boost toggles
+        next_change_label: str — "ends in X" or "starts in X"
+        local_peak_start: str — peak start in user's local time (e.g. "5:00 AM")
+        local_peak_end: str — peak end in user's local time (e.g. "11:00 AM")
+    """
+    if BOOST_END is None:
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc < BOOST_START or now_utc >= BOOST_END:
+        return None
+
+    now_et = now_utc.astimezone(BOOST_TZ)
+    hour_et = now_et.hour
+
+    # Peak hours (no boost): 8 AM - 2 PM ET
+    in_peak = BOOST_PEAK_START <= hour_et < BOOST_PEAK_END
+    is_boosted = not in_peak
+
+    # Calculate seconds until next transition
+    if in_peak:
+        # Currently in peak → boost starts at BOOST_PEAK_END ET
+        next_et = now_et.replace(hour=BOOST_PEAK_END, minute=0, second=0, microsecond=0)
+        secs = int((next_et - now_et).total_seconds())
+        label = _compact_duration(secs, "starts")
+    else:
+        # Currently boosted → peak starts at BOOST_PEAK_START ET
+        if hour_et >= BOOST_PEAK_END:
+            # Evening: peak is tomorrow morning
+            next_et = (now_et + timedelta(days=1)).replace(
+                hour=BOOST_PEAK_START, minute=0, second=0, microsecond=0
+            )
+        else:
+            # Early morning: peak is today
+            next_et = now_et.replace(hour=BOOST_PEAK_START, minute=0, second=0, microsecond=0)
+        secs = int((next_et - now_et).total_seconds())
+        label = _compact_duration(secs, "ends")
+
+    # Convert peak hours to user's local timezone for display
+    now_local = now_utc.astimezone()
+    et_offset = now_et.utcoffset().total_seconds()
+    local_offset = now_local.utcoffset().total_seconds()
+    shift_hours = (local_offset - et_offset) / 3600
+
+    local_start_h = int((BOOST_PEAK_START + shift_hours) % 24)
+    local_end_h = int((BOOST_PEAK_END + shift_hours) % 24)
+
+    def fmt_hour(h):
+        if h == 0:
+            return "12 AM"
+        if h < 12:
+            return f"{h} AM"
+        if h == 12:
+            return "12 PM"
+        return f"{h - 12} PM"
+
+    return {
+        "active": is_boosted,
+        "next_change_sec": secs,
+        "next_change_label": label,
+        "local_peak_start": fmt_hour(local_start_h),
+        "local_peak_end": fmt_hour(local_end_h),
+    }
+
+
+def _compact_duration(secs: int, prefix: str) -> str:
+    """Format seconds as 'prefix Xh Ym' or 'prefix Ym'."""
+    if secs < 3600:
+        return f"{prefix} {secs // 60}m"
+    h = secs // 3600
+    m = (secs % 3600) // 60
+    return f"{prefix} {h}h{f' {m}m' if m else ''}"
+
+
+def menu_bar_title(s_pct, w_pct, boosted: bool = False) -> str:
+    """Compact title: CC 5%·18% or CC ⚡5%·18% when boosted."""
     s = pct_str(s_pct)
     w = pct_str(w_pct)
+    if boosted:
+        return f"CC ⚡{s}·{w}"
     return f"CC {s}·{w}"
 
 
@@ -156,6 +246,12 @@ class ClaudeUsageApp(rumps.App):
         self.sonnet_bar_item = make_item("│  ░░░░░░░░░░░░░░░░░░  —")
         self.sonnet_spacer = make_item("│")
 
+        # Boost promotion line (hidden when no promo)
+        self.boost_line = make_item("│")
+
+        # Weekly projection (single compact line)
+        self.stats_line = make_item("│  ⚡ —")
+
         # Footer
         self.updated_item = make_item("│  Updated: —")
         self.footer_item = make_item("╰─────────────────────────────────────────╯")
@@ -185,6 +281,8 @@ class ClaudeUsageApp(rumps.App):
             self.sonnet_label,
             self.sonnet_bar_item,
             self.sonnet_spacer,
+            self.boost_line,
+            self.stats_line,
             self.updated_item,
             self.footer_item,
             None,
@@ -245,8 +343,12 @@ class ClaudeUsageApp(rumps.App):
         w_pct = self._to_pct(seven.get("utilization"))
         sn_pct = self._to_pct(sonnet.get("utilization"))
 
-        # Menu bar title (session + weekly only)
-        self.title = menu_bar_title(s_pct, w_pct)
+        # Boost status
+        bs = boost_status()
+        is_boosted = bs["active"] if bs else False
+
+        # Menu bar title (session + weekly, ⚡ when boosted)
+        self.title = menu_bar_title(s_pct, w_pct, is_boosted)
 
         # Session row
         s_reset = time_until(five.get("resets_at", ""))
@@ -283,12 +385,67 @@ class ClaudeUsageApp(rumps.App):
             self.sonnet_label.title = "│  🎯 Sonnet Only   ⚪ —"
             self.sonnet_bar_item.title = f"│  {'░' * BAR_WIDTH}"
 
+        # Boost promotion line
+        if bs:
+            if bs["active"]:
+                self.boost_line.title = (
+                    f"│  🟣 2x Boost on · {bs['next_change_label']}"
+                )
+            else:
+                self.boost_line.title = (
+                    f"│  ⏳ 2x Boost {bs['next_change_label']}"
+                    f" · peak {bs['local_peak_start']}–{bs['local_peak_end']}"
+                )
+        else:
+            self.boost_line.title = "│"
+
+        # Weekly stats
+        self._update_weekly_stats(w_pct, seven.get("resets_at", ""))
+
         # Updated timestamp
         now_str = datetime.now().strftime("%-I:%M %p")
         self.updated_item.title = f"│  Updated: {now_str}"
 
         # Notifications
         self._check_notifications(s_pct, w_pct, sn_pct, five.get("resets_at", ""))
+
+    def _update_weekly_stats(self, w_pct: float | None, resets_at: str):
+        """Calculate and display weekly projection as a single compact line."""
+        if w_pct is None or not resets_at:
+            self.stats_line.title = "│"
+            return
+
+        try:
+            target = datetime.fromisoformat(resets_at)
+            now = datetime.now(timezone.utc)
+            remaining_sec = max(0, (target - now).total_seconds())
+            elapsed_sec = max(1, 7 * 86400 - remaining_sec)
+            elapsed_days = elapsed_sec / 86400
+            remaining_days = remaining_sec / 86400
+
+            daily_avg = w_pct / elapsed_days
+            projected = w_pct + (daily_avg * remaining_days)
+
+            if projected > 100:
+                days_to_limit = (100 - w_pct) / daily_avg if daily_avg > 0 else 99
+                limit_date = now + timedelta(days=days_to_limit)
+                proj_str = f"100% by {limit_date.strftime('%a')}"
+                pace = "🔴"
+            elif projected > 75:
+                proj_str = f"~{int(projected)}% by reset"
+                pace = "🟠"
+            elif projected > 50:
+                proj_str = f"~{int(projected)}% by reset"
+                pace = "🟡"
+            else:
+                proj_str = f"~{int(projected)}% by reset"
+                pace = "🟢"
+
+            self.stats_line.title = (
+                f"│  ⚡ {pace} {proj_str} · {daily_avg:.0f}%/day"
+            )
+        except Exception:
+            self.stats_line.title = "│"
 
     @staticmethod
     def _to_pct(value) -> float | None:
