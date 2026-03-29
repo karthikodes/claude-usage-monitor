@@ -1,60 +1,89 @@
 #!/usr/bin/env bash
 # Install Claude Usage Monitor menu bar app
-# - Builds the .app
-# - Copies to /Applications
-# - Installs LaunchAgent for auto-start on login
+# - Installs Python dependency (rumps)
+# - Creates a LaunchAgent for auto-start on login
 # - Starts the app immediately
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-MENUBAR_DIR="$REPO_DIR/menubar"
-PLIST_SRC="$SCRIPT_DIR/com.karthikodes.claude-usage-monitor.plist"
-APP_NAME="Claude Usage Monitor.app"
-APP_DEST="/Applications/$APP_NAME"
+SCRIPT_PATH="$REPO_DIR/menubar/claude_usage_menubar.py"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_DEST="$LAUNCH_AGENTS_DIR/com.karthikodes.claude-usage-monitor.plist"
-LABEL="com.karthikodes.claude-usage-monitor"
+PYTHON="$(command -v python3)"
 
-# ── 1. Build ──────────────────────────────────────────────────────────────────
-echo "🔨 Building $APP_NAME..."
-"$SCRIPT_DIR/build-app.sh"
+# ── 1. Check prerequisites ───────────────────────────────────────────────────
+echo "🔍 Checking prerequisites..."
 
-# ── 2. Copy to /Applications ──────────────────────────────────────────────────
-echo "📦 Installing to /Applications..."
-if [ -d "$APP_DEST" ]; then
-    echo "  Removing existing installation..."
-    rm -rf "$APP_DEST"
+if [ -z "$PYTHON" ]; then
+    echo "❌ python3 not found. Install Python 3.9+ first."
+    exit 1
 fi
-cp -R "$MENUBAR_DIR/dist/$APP_NAME" "$APP_DEST"
-echo "  ✅ Installed: $APP_DEST"
 
-# ── 3. Install LaunchAgent ────────────────────────────────────────────────────
-echo "🚀 Installing LaunchAgent..."
+echo "  Python: $PYTHON ($($PYTHON --version 2>&1))"
+
+# Check for Claude Code credentials in Keychain
+if ! security find-generic-password -s "Claude Code-credentials" -w &>/dev/null; then
+    echo "❌ Claude Code credentials not found in Keychain."
+    echo "  Install Claude Code and log in first: https://claude.ai/download"
+    exit 1
+fi
+echo "  Keychain: ✅ Claude Code credentials found"
+
+# ── 2. Install dependency ────────────────────────────────────────────────────
+echo "📦 Installing rumps..."
+$PYTHON -m pip install --quiet rumps
+echo "  ✅ rumps installed"
+
+# ── 3. Create LaunchAgent ────────────────────────────────────────────────────
+echo "🚀 Setting up auto-start..."
 mkdir -p "$LAUNCH_AGENTS_DIR"
-cp "$PLIST_SRC" "$PLIST_DEST"
 
-# Unload if already loaded (ignore errors)
+cat > "$PLIST_DEST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.karthikodes.claude-usage-monitor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${PYTHON}</string>
+        <string>${SCRIPT_PATH}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-usage-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-usage-monitor.error.log</string>
+</dict>
+</plist>
+PLIST
+
+# Unload if already loaded
 launchctl unload "$PLIST_DEST" 2>/dev/null || true
 
-# Load it
-launchctl load "$PLIST_DEST"
-echo "  ✅ LaunchAgent installed: $PLIST_DEST"
-
-# ── 4. Start immediately ──────────────────────────────────────────────────────
+# ── 4. Start ─────────────────────────────────────────────────────────────────
 echo "▶️  Starting Claude Usage Monitor..."
-# Kill any running instance first
 pkill -f "claude_usage_menubar" 2>/dev/null || true
 sleep 1
 
-# Launch the .app
-open "$APP_DEST"
+launchctl load "$PLIST_DEST"
 echo "  ✅ Running!"
 
 echo ""
 echo "✅ Installation complete!"
-echo "   • App: $APP_DEST"
+echo "   • Script: $SCRIPT_PATH"
+echo "   • Python: $PYTHON"
 echo "   • LaunchAgent: $PLIST_DEST"
 echo "   • Auto-starts on login"
 echo "   • Logs: /tmp/claude-usage-monitor.log"
+echo ""
+echo "To uninstall:"
+echo "   launchctl unload $PLIST_DEST"
+echo "   rm $PLIST_DEST"
